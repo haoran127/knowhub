@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <title>KnowHub - 个人知识库</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- 阅读进度条 -->
+    <div class="reading-progress" id="readingProgress"></div>
+    
+    <div class="app">
+        <!-- 侧边栏 -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <span class="logo-icon">📚</span>
+                    <span class="logo-text">{{SITE_NAME}}</span>
+                </div>
+                <div class="sidebar-links">
+                    <a href="/rss.xml" target="_blank" class="sidebar-link" title="RSS 订阅">📡</a>
+                    <a href="/about" class="sidebar-link" title="关于">👤</a>
+                </div>
+            </div>
+            
+            <!-- 搜索框 -->
+            <div class="search-box">
+                <input type="text" id="searchInput" placeholder="搜索文档... (Ctrl+K)" autocomplete="off">
+                <span class="search-icon">🔍</span>
+            </div>
+            
+            <!-- 搜索结果 -->
+            <div id="searchResults" class="search-results hidden"></div>
+            
+            <!-- 目录树 -->
+            <div class="tree-container">
+                <div class="tree-header">
+                    <span>文档目录</span>
+                    <div class="tree-actions admin-only" style="display: none;">
+                        <div class="add-menu-wrapper">
+                            <button class="btn-icon" id="addMenuBtn" title="添加">➕</button>
+                            <div class="add-menu" id="addMenu">
+                                <button class="add-menu-item" onclick="createRootDoc(); hideAddMenu();">
+                                    <span class="add-menu-icon">📄</span>
+                                    <span>新建文档</span>
+                                </button>
+                                <button class="add-menu-item" onclick="showAIGenerateDialog(); hideAddMenu();">
+                                    <span class="add-menu-icon">✨</span>
+                                    <span>AI 生成目录</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div id="treeView" class="tree-view"></div>
+            </div>
+        </aside>
+        
+        <!-- 移动端遮罩 -->
+        <div class="mobile-overlay" id="mobileOverlay" onclick="toggleSidebar()"></div>
+        
+        <!-- 主内容区 -->
+        <main class="main-content">
+            <!-- 顶部工具栏 -->
+            <header class="toolbar">
+                <div class="toolbar-left">
+                    <button class="btn-menu" onclick="toggleSidebar()">☰</button>
+                    <div class="breadcrumb" id="breadcrumb">
+                        <span class="breadcrumb-item">选择文档开始阅读</span>
+                    </div>
+                </div>
+                <div class="toolbar-actions">
+                    <button class="btn btn-primary btn-sm admin-only" id="uploadBtn" style="display: none;" onclick="triggerUpload()">
+                        <span class="btn-text">📤 上传</span>
+                    </button>
+                    <button class="btn btn-secondary btn-sm admin-only" id="uploadImageBtn" style="display: none;" onclick="triggerImageUpload()" title="上传图片">
+                        <span class="btn-text">🖼️</span>
+                    </button>
+                    <input type="file" id="fileInput" accept=".md" style="display: none;" onchange="handleFileUpload(event)">
+                    <input type="file" id="imageInput" accept="image/*" style="display: none;" onchange="handleImageUpload(event)">
+                    
+                    <!-- 管理员状态（仅登录后显示） -->
+                    <div class="user-status admin-only" id="userStatus" style="display: none;"></div>
+                    <button class="btn btn-secondary btn-sm admin-only" id="adminPanelBtn" style="display: none;" onclick="toggleAdminPanel()" title="管理面板">
+                        ⚙️
+                    </button>
+                </div>
+            </header>
+            
+            <!-- 文档内容 -->
+            <article class="document-content" id="documentContent">
+                <div class="welcome-screen">
+                    <div class="welcome-icon">📖</div>
+                    <h1>欢迎使用 {{SITE_NAME}}</h1>
+                    <p>知识沉淀 · 持续积累 · 随时查阅</p>
+                    <div class="welcome-tips">
+                        <div class="tip">
+                            <span class="tip-icon">📚</span>
+                            <span>从左侧目录选择文档开始阅读</span>
+                        </div>
+                        <div class="tip">
+                            <span class="tip-icon">🔍</span>
+                            <span>使用搜索框快速查找内容</span>
+                        </div>
+                        <div class="tip">
+                            <span class="tip-icon">💬</span>
+                            <span>点击右下角按钮参与讨论或提问</span>
+                        </div>
+                    </div>
+                </div>
+            </article>
+            
+            <!-- 文章目录 (TOC) -->
+            <aside class="toc-sidebar" id="tocSidebar">
+                <div class="toc-header">目录</div>
+                <nav class="toc-nav" id="tocNav"></nav>
+            </aside>
+        </main>
+    </div>
+    
+    <!-- 右键菜单 -->
+    <div id="contextMenu" class="context-menu hidden">
+        <div class="menu-item" onclick="contextAction('addChild')">
+            <span class="menu-icon">➕</span> 新建子文档
+        </div>
+        <div class="menu-item" onclick="contextAction('addChildAI')">
+            <span class="menu-icon">✨</span> 新建子文档（AI）
+        </div>
+        <div class="menu-divider"></div>
+        <div class="menu-item" onclick="contextAction('rename')">
+            <span class="menu-icon">✏️</span> 重命名
+        </div>
+        <div class="menu-item menu-item-danger" onclick="contextAction('delete')">
+            <span class="menu-icon">🗑️</span> 删除
+        </div>
+    </div>
+    
+    <!-- 右下角浮动按钮组 -->
+    <div class="fab-group">
+        <button class="fab fab-top" onclick="scrollToTop()" title="返回顶部" id="backToTop">
+            <span class="fab-icon">↑</span>
+        </button>
+        <button class="fab fab-theme" onclick="toggleTheme()" title="切换主题" id="themeFab">
+            <span class="fab-icon" id="themeIcon">🌙</span>
+        </button>
+        <button class="fab fab-comment" onclick="toggleCommentDrawer()" title="讨论与反馈" id="commentFab">
+            <span class="fab-icon">💬</span>
+            <span class="fab-badge" id="commentFabCount"></span>
+        </button>
+        <button class="fab fab-ai" onclick="toggleAIDrawer()" title="AI 助手">
+            <span class="fab-icon">✨</span>
+        </button>
+    </div>
+    
+    <!-- 评论抽屉 -->
+    <div id="commentDrawer" class="comment-drawer hidden">
+        <div class="comment-drawer-header">
+            <div class="comment-drawer-title">
+                <span>💬</span>
+                <span>讨论与反馈</span>
+                <span class="comment-drawer-count" id="commentDrawerCount"></span>
+            </div>
+            <button class="btn-close" onclick="toggleCommentDrawer()">&times;</button>
+        </div>
+        <div class="comment-drawer-doc" id="commentDocName">
+            <span class="doc-label">当前文档：</span>
+            <span class="doc-name">未选择文档</span>
+        </div>
+        <div class="comment-drawer-form">
+            <div class="comment-form-row">
+                <input type="text" id="commentAuthor" placeholder="你的昵称" maxlength="50">
+            </div>
+            <textarea id="commentContent" placeholder="写下你的想法、问题或建议..." maxlength="2000" rows="3"></textarea>
+            <div class="comment-form-actions">
+                <button class="btn btn-primary" onclick="submitComment()">发表评论</button>
+            </div>
+        </div>
+        <div class="comment-drawer-list" id="commentsContainer">
+            <div class="comments-empty">
+                <div class="comments-empty-icon">💬</div>
+                <p>选择文档后查看评论</p>
+            </div>
+        </div>
+    </div>
+    
+    <!-- AI 对话抽屉 -->
+    <div id="aiDrawer" class="ai-drawer hidden">
+        <div class="ai-drawer-header">
+            <div class="ai-drawer-title">
+                <span class="ai-title-icon">✨</span>
+                <span>AI 助手</span>
+            </div>
+            <button class="btn-close" onclick="toggleAIDrawer()">&times;</button>
+        </div>
+        <div class="ai-drawer-status">
+            <div class="ai-user-status" id="aiUserStatus">
+                <span class="ai-status-level">游客</span>
+                <span class="ai-status-count">今日: 0/3</span>
+            </div>
+            <div class="ai-user-actions" id="aiUserActions">
+                <button class="btn btn-sm btn-secondary" onclick="showUserLoginDialog()">登录</button>
+                <button class="btn btn-sm btn-primary" onclick="showUserRegisterDialog()">注册</button>
+            </div>
+        </div>
+        <div class="ai-drawer-context" id="aiContext">
+            <span class="context-label">当前文档：</span>
+            <span class="context-name" id="aiContextName">未选择文档</span>
+        </div>
+        <div class="ai-drawer-messages" id="aiMessages">
+            <div class="ai-message ai-message-assistant">
+                <div class="ai-message-content">
+                    👋 你好！我是 KnowHub 的 AI 助手，可以帮你分析和讨论文档内容。选择一个文档后，问我任何问题吧！
+                </div>
+            </div>
+        </div>
+        <div class="ai-drawer-input">
+            <textarea id="aiInput" placeholder="输入你的问题..." rows="2"></textarea>
+            <button class="btn btn-primary ai-send-btn" onclick="sendAIMessage()">
+                发送
+            </button>
+        </div>
+    </div>
+    
+    <!-- 创建节点对话框 -->
+    <div id="createDialog" class="dialog-overlay hidden">
+        <div class="dialog">
+            <div class="dialog-header">
+                <h3 id="dialogTitle">新建</h3>
+                <button class="btn-close" onclick="closeDialog()">&times;</button>
+            </div>
+            <div class="dialog-body">
+                <input type="text" id="nodeName" placeholder="请输入名称" autocomplete="off">
+            </div>
+            <div class="dialog-footer">
+                <button class="btn btn-secondary" onclick="closeDialog()">取消</button>
+                <button class="btn btn-primary" onclick="confirmCreate()">确定</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 登录对话框 -->
+    <div id="loginDialog" class="dialog-overlay hidden">
+        <div class="dialog">
+            <div class="dialog-header">
+                <h3>🔐 管理员登录</h3>
+                <button class="btn-close" onclick="closeLoginDialog()">&times;</button>
+            </div>
+            <div class="dialog-body">
+                <div class="form-group">
+                    <label>用户名</label>
+                    <input type="text" id="loginUsername" placeholder="请输入用户名" autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label>密码</label>
+                    <input type="password" id="loginPassword" placeholder="请输入密码" autocomplete="current-password">
+                </div>
+                <div class="form-error" id="loginError"></div>
+            </div>
+            <div class="dialog-footer">
+                <button class="btn btn-secondary" onclick="closeLoginDialog()">取消</button>
+                <button class="btn btn-primary" onclick="doLogin()">登录</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 用户登录对话框 -->
+    <div id="userLoginDialog" class="dialog-overlay hidden">
+        <div class="dialog">
+            <div class="dialog-header">
+                <h3>🔑 用户登录</h3>
+                <button class="btn-close" onclick="closeUserLoginDialog()">&times;</button>
+            </div>
+            <div class="dialog-body">
+                <div class="form-group">
+                    <label>用户名</label>
+                    <input type="text" id="userLoginUsername" placeholder="请输入用户名" autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label>密码</label>
+                    <input type="password" id="userLoginPassword" placeholder="请输入密码" autocomplete="current-password">
+                </div>
+                <div class="form-error" id="userLoginError"></div>
+            </div>
+            <div class="dialog-footer">
+                <button class="btn btn-secondary" onclick="closeUserLoginDialog()">取消</button>
+                <button class="btn btn-primary" onclick="doUserLogin()">登录</button>
+            </div>
+            <div class="dialog-tip">
+                还没有账号？<a href="javascript:closeUserLoginDialog();showUserRegisterDialog();">立即注册</a>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 用户注册对话框 -->
+    <div id="userRegisterDialog" class="dialog-overlay hidden">
+        <div class="dialog">
+            <div class="dialog-header">
+                <h3>📝 用户注册</h3>
+                <button class="btn-close" onclick="closeUserRegisterDialog()">&times;</button>
+            </div>
+            <div class="dialog-body">
+                <div class="form-group">
+                    <label>用户名</label>
+                    <input type="text" id="userRegUsername" placeholder="2-20个字符，字母数字" autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label>密码</label>
+                    <input type="password" id="userRegPassword" placeholder="至少6个字符" autocomplete="new-password">
+                </div>
+                <div class="form-group">
+                    <label>邮箱（选填）</label>
+                    <input type="email" id="userRegEmail" placeholder="用于找回密码" autocomplete="email">
+                </div>
+                <div class="form-error" id="userRegError"></div>
+            </div>
+            <div class="dialog-footer">
+                <button class="btn btn-secondary" onclick="closeUserRegisterDialog()">取消</button>
+                <button class="btn btn-primary" onclick="doUserRegister()">注册</button>
+            </div>
+            <div class="dialog-tip">
+                已有账号？<a href="javascript:closeUserRegisterDialog();showUserLoginDialog();">立即登录</a>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 管理员面板抽屉 -->
+    <div id="adminPanel" class="admin-panel hidden">
+        <div class="admin-panel-header">
+            <div class="admin-panel-title">
+                <span>⚙️</span>
+                <span>管理面板</span>
+            </div>
+            <button class="btn-close" onclick="toggleAdminPanel()">&times;</button>
+        </div>
+        
+        <!-- 标签导航 -->
+        <div class="admin-tabs">
+            <button class="admin-tab active" data-tab="codes" onclick="switchAdminTab('codes')">
+                🎫 激活码
+            </button>
+            <button class="admin-tab" data-tab="users" onclick="switchAdminTab('users')">
+                👥 用户
+            </button>
+        </div>
+        
+        <!-- 激活码管理面板 -->
+        <div id="adminTabCodes" class="admin-tab-content active">
+            <!-- 生成激活码 -->
+            <div class="admin-card">
+                <div class="admin-card-header">
+                    <h4>生成激活码</h4>
+                </div>
+                <div class="admin-card-body">
+                    <div class="generate-form">
+                        <div class="form-inline">
+                            <div class="form-group">
+                                <label>数量</label>
+                                <input type="number" id="codeCount" value="10" min="1" max="100">
+                            </div>
+                            <div class="form-group">
+                                <label>等级</label>
+                                <select id="codeLevel">
+                                    <option value="vip">VIP（50次/天）</option>
+                                    <option value="svip">SVIP（200次/天）</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>有效期（天）</label>
+                                <input type="number" id="codeDays" value="30" min="1" max="365">
+                            </div>
+                            <button class="btn btn-primary" onclick="generateCodes()">生成</button>
+                        </div>
+                    </div>
+                    
+                    <!-- 新生成的激活码 -->
+                    <div id="newCodesArea" class="new-codes-area" style="display: none;">
+                        <div class="new-codes-header">
+                            <span>✨ 新生成的激活码</span>
+                            <button class="btn btn-sm btn-secondary" onclick="copyAllCodes()">📋 复制全部</button>
+                        </div>
+                        <div id="newCodesList" class="new-codes-list"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 激活码列表 -->
+            <div class="admin-card">
+                <div class="admin-card-header">
+                    <h4>激活码列表</h4>
+                    <div class="header-actions">
+                        <div class="codes-filter">
+                            <label><input type="checkbox" id="filterUnused" checked onchange="filterCodes()"> 未使用</label>
+                            <label><input type="checkbox" id="filterUsed" onchange="filterCodes()"> 已使用</label>
+                        </div>
+                        <button class="btn btn-sm btn-secondary" onclick="loadAdminCodes()">🔄 刷新</button>
+                    </div>
+                </div>
+                <div class="admin-card-body">
+                    <div id="codesListContainer" class="codes-table-container">
+                        <div class="loading-text">加载中...</div>
+                    </div>
+                    <div id="codesStats" class="codes-stats"></div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 用户管理面板 -->
+        <div id="adminTabUsers" class="admin-tab-content">
+            <div class="admin-card">
+                <div class="admin-card-header">
+                    <h4>用户列表</h4>
+                    <div class="header-actions">
+                        <span id="usersCount" class="stats-badge"></span>
+                        <button class="btn btn-sm btn-secondary" onclick="loadAdminUsers()">🔄 刷新</button>
+                    </div>
+                </div>
+                <div class="admin-card-body">
+                    <div id="usersListContainer" class="users-table-container">
+                        <div class="loading-text">加载中...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 激活码对话框 -->
+    <div id="activateCodeDialog" class="dialog-overlay hidden">
+        <div class="dialog">
+            <div class="dialog-header">
+                <h3>🎫 激活会员</h3>
+                <button class="btn-close" onclick="closeActivateDialog()">&times;</button>
+            </div>
+            <div class="dialog-body">
+                <p class="activate-tip">输入激活码升级为 VIP 会员，享受更多 AI 对话次数</p>
+                <div class="form-group">
+                    <label>激活码</label>
+                    <input type="text" id="activateCodeInput" placeholder="XXXX-XXXX-XXXX-XXXX" autocomplete="off" style="text-transform: uppercase; letter-spacing: 1px;">
+                </div>
+                <div class="form-error" id="activateError"></div>
+            </div>
+            <div class="dialog-footer">
+                <button class="btn btn-secondary" onclick="closeActivateDialog()">取消</button>
+                <button class="btn btn-primary" onclick="doActivateCode()">激活</button>
+            </div>
+            <div class="dialog-tip">
+                还没有激活码？<a href="javascript:alert('请联系站长购买激活码');">获取激活码</a>
+            </div>
+        </div>
+    </div>
+    
+    <!-- AI 生成目录抽屉 -->
+    <div id="aiGenerateDrawer" class="ai-generate-drawer hidden">
+        <div class="ai-generate-drawer-header">
+            <div class="ai-generate-drawer-title">
+                <span>✨</span>
+                <span>AI 生成目录</span>
+            </div>
+            <button class="btn-close" onclick="closeAIGenerateDialog()">&times;</button>
+        </div>
+        
+        <div class="ai-generate-drawer-body">
+            <div id="aiGenerateParentInfo" class="parent-info" style="display: none;"></div>
+            <p class="drawer-desc">描述你想要创建的文档结构，AI 将帮你自动生成目录树</p>
+            
+            <div class="form-group">
+                <label>描述你的需求</label>
+                <textarea id="aiGeneratePrompt" rows="4" placeholder="例如：帮我创建一个 Python 学习教程的目录，包含基础语法、数据结构、面向对象、文件操作等章节"></textarea>
+            </div>
+            
+            <div class="form-group">
+                <label>生成层级</label>
+                <select id="aiGenerateDepth">
+                    <option value="2">2 层（章节 + 小节）</option>
+                    <option value="3" selected>3 层（章节 + 小节 + 详细）</option>
+                    <option value="1">1 层（仅章节）</option>
+                </select>
+            </div>
+            
+            <div class="form-error" id="aiGenerateError"></div>
+            
+            <div class="generate-actions">
+                <button class="btn btn-primary btn-block" id="aiGenerateBtn" onclick="generateTreeWithAI()">
+                    <span id="aiGenerateBtnText">✨ 生成预览</span>
+                </button>
+            </div>
+            
+            <!-- 预览区域 -->
+            <div id="aiGeneratePreview" class="ai-generate-preview" style="display: none;">
+                <div class="preview-header">
+                    <span>📋 预览</span>
+                    <button class="btn btn-sm btn-secondary" onclick="regenerateTree()">🔄 重新生成</button>
+                </div>
+                <div id="aiGenerateTree" class="preview-tree"></div>
+                <div class="preview-actions">
+                    <button class="btn btn-success btn-block" id="aiConfirmBtn" onclick="confirmAIGenerate()">✓ 确认创建到目录</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="/static/app.js"></script>
+</body>
+</html>
+

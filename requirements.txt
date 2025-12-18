@@ -1,0 +1,12 @@
+# KnowHub - 技术笔记与经验分享
+# Python 3.9+
+
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-multipart>=0.0.6
+markdown>=3.5.0
+Pygments>=2.17.0
+aiofiles>=23.2.1
+jinja2>=3.1.2
+httpx>=0.25.0
+
