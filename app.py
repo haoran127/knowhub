@@ -2115,13 +2115,16 @@ init_db()
 # 迁移旧数据（如果存在）
 migrate_json_to_sqlite()
 
+# 默认端口
+PORT = int(os.getenv("PORT", 8000))
+
 if __name__ == "__main__":
     print("=" * 50)
     print("  KnowHub - 个人知识库")
     print("=" * 50)
-    print(f"  访问地址: http://localhost:8090")
+    print(f"  访问地址: http://localhost:{PORT}")
     print(f"  文档目录: {DOCS_DIR}")
     print(f"  数据库: {DB_FILE}")
     print("=" * 50)
-    uvicorn.run(app, host="0.0.0.0", port=8090)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
 
