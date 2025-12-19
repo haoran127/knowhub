@@ -9,9 +9,13 @@ import json
 import shutil
 import hashlib
 import secrets
+import sqlite3
+import threading
+import uuid
 from pathlib import Path
 from typing import Optional, List
 from datetime import datetime, timedelta
+from contextlib import contextmanager
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Cookie, Response, Depends, Request, Header
 from fastapi.staticfiles import StaticFiles
@@ -86,10 +90,11 @@ MEMBER_LEVELS = {
     }
 }
 
-# 用户数据文件
-USERS_FILE = BASE_DIR / "data" / "users.json"
-AI_USAGE_FILE = BASE_DIR / "data" / "ai_usage.json"
-CODES_FILE = BASE_DIR / "data" / "activation_codes.json"
+# SQLite 数据库文件
+DB_FILE = BASE_DIR / "data" / "knowhub.db"
+
+# 数据库连接锁（线程安全）
+_db_lock = threading.Lock()
 
 # ============================================================
 # 管理员配置（可修改）
@@ -225,57 +230,228 @@ def save_comments(comments: dict):
     with open(COMMENTS_FILE, "w", encoding="utf-8") as f:
         json.dump(comments, f, ensure_ascii=False, indent=2)
 
-def load_sessions() -> dict:
-    """加载会话数据"""
-    if SESSIONS_FILE.exists():
+# ============================================================
+# SQLite 数据库操作
+# ============================================================
+@contextmanager
+def get_db():
+    """获取数据库连接（线程安全）"""
+    conn = sqlite3.connect(str(DB_FILE), check_same_thread=False)
+    conn.row_factory = sqlite3.Row  # 返回字典格式
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def init_db():
+    """初始化数据库表"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # 管理员会话表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                token TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                expire_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        
+        # 用户表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password TEXT NOT NULL,
+                email TEXT DEFAULT '',
+                level TEXT DEFAULT 'basic',
+                level_expire_at TEXT,
+                session_token TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        
+        # AI 使用记录表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ai_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                identifier TEXT NOT NULL,
+                date TEXT NOT NULL,
+                count INTEGER DEFAULT 0,
+                UNIQUE(identifier, date)
+            )
+        """)
+        
+        # 激活码表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS activation_codes (
+                code TEXT PRIMARY KEY,
+                level TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                used INTEGER DEFAULT 0,
+                used_by TEXT,
+                used_at TEXT
+            )
+        """)
+        
+        # 创建索引
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ai_usage_identifier ON ai_usage(identifier)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ai_usage_date ON ai_usage(date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_session ON users(session_token)")
+        
+        conn.commit()
+        print("✅ 数据库初始化完成")
+
+def migrate_json_to_sqlite():
+    """从 JSON 文件迁移数据到 SQLite（仅运行一次）"""
+    migrated = False
+    
+    # 迁移用户数据
+    users_file = BASE_DIR / "data" / "users.json"
+    if users_file.exists():
         try:
-            with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
+            users = json.loads(users_file.read_text(encoding="utf-8"))
+            with get_db() as conn:
+                cursor = conn.cursor()
+                for username, user in users.items():
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO users (username, password, email, level, level_expire_at, session_token, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        username,
+                        user.get("password", ""),
+                        user.get("email", ""),
+                        user.get("level", "basic"),
+                        user.get("level_expire_at"),
+                        user.get("session_token"),
+                        user.get("created_at", get_timestamp())
+                    ))
+            users_file.rename(users_file.with_suffix(".json.bak"))
+            print(f"✅ 已迁移 {len(users)} 个用户")
+            migrated = True
+        except Exception as e:
+            print(f"⚠️ 迁移用户数据失败: {e}")
+    
+    # 迁移管理员会话
+    sessions_file = BASE_DIR / "data" / "sessions.json"
+    if sessions_file.exists():
+        try:
+            sessions = json.loads(sessions_file.read_text(encoding="utf-8"))
+            with get_db() as conn:
+                cursor = conn.cursor()
+                for token, session in sessions.items():
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO admin_sessions (token, username, expire_at, created_at)
+                        VALUES (?, ?, ?, ?)
+                    """, (
+                        token,
+                        session.get("username", ""),
+                        session.get("expire_at", ""),
+                        session.get("created_at", get_timestamp())
+                    ))
+            sessions_file.rename(sessions_file.with_suffix(".json.bak"))
+            print(f"✅ 已迁移 {len(sessions)} 个管理员会话")
+            migrated = True
+        except Exception as e:
+            print(f"⚠️ 迁移管理员会话失败: {e}")
+    
+    # 迁移 AI 使用记录
+    ai_usage_file = BASE_DIR / "data" / "ai_usage.json"
+    if ai_usage_file.exists():
+        try:
+            usage = json.loads(ai_usage_file.read_text(encoding="utf-8"))
+            with get_db() as conn:
+                cursor = conn.cursor()
+                for identifier, dates in usage.items():
+                    for date, count in dates.items():
+                        cursor.execute("""
+                            INSERT OR IGNORE INTO ai_usage (identifier, date, count)
+                            VALUES (?, ?, ?)
+                        """, (identifier, date, count))
+            ai_usage_file.rename(ai_usage_file.with_suffix(".json.bak"))
+            print(f"✅ 已迁移 AI 使用记录")
+            migrated = True
+        except Exception as e:
+            print(f"⚠️ 迁移 AI 使用记录失败: {e}")
+    
+    # 迁移激活码
+    codes_file = BASE_DIR / "data" / "activation_codes.json"
+    if codes_file.exists():
+        try:
+            codes = json.loads(codes_file.read_text(encoding="utf-8"))
+            with get_db() as conn:
+                cursor = conn.cursor()
+                for code, info in codes.items():
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO activation_codes (code, level, days, created_at, used, used_by, used_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        code,
+                        info.get("level", "vip"),
+                        info.get("days", 30),
+                        info.get("created_at", get_timestamp()),
+                        1 if info.get("used") else 0,
+                        info.get("used_by"),
+                        info.get("used_at")
+                    ))
+            codes_file.rename(codes_file.with_suffix(".json.bak"))
+            print(f"✅ 已迁移 {len(codes)} 个激活码")
+            migrated = True
+        except Exception as e:
+            print(f"⚠️ 迁移激活码失败: {e}")
+    
+    if migrated:
+        print("✅ 数据迁移完成！旧 JSON 文件已重命名为 .json.bak")
 
-def save_sessions(sessions: dict):
-    """保存会话数据"""
-    with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
-        json.dump(sessions, f, ensure_ascii=False, indent=2)
-
+# ============================================================
+# 管理员会话管理（SQLite 版）
+# ============================================================
 def create_session(username: str) -> str:
-    """创建新会话"""
-    sessions = load_sessions()
+    """创建新的管理员会话"""
     token = secrets.token_hex(32)
     expire_at = (datetime.now() + timedelta(hours=SESSION_EXPIRE_HOURS)).isoformat()
-    sessions[token] = {
-        "username": username,
-        "expire_at": expire_at,
-        "created_at": get_timestamp()
-    }
-    save_sessions(sessions)
+    
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO admin_sessions (token, username, expire_at, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (token, username, expire_at, get_timestamp()))
+    
     return token
 
 def verify_session(token: str) -> Optional[str]:
-    """验证会话，返回用户名或 None"""
+    """验证管理员会话，返回用户名或 None"""
     if not token:
         return None
-    sessions = load_sessions()
-    session = sessions.get(token)
-    if not session:
-        return None
-    # 检查是否过期
-    expire_at = datetime.fromisoformat(session["expire_at"])
-    if datetime.now() > expire_at:
-        # 删除过期会话
-        del sessions[token]
-        save_sessions(sessions)
-        return None
-    return session["username"]
+    
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT username, expire_at FROM admin_sessions WHERE token = ?", (token,))
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        # 检查是否过期
+        expire_at = datetime.fromisoformat(row["expire_at"])
+        if datetime.now() > expire_at:
+            # 删除过期会话
+            cursor.execute("DELETE FROM admin_sessions WHERE token = ?", (token,))
+            return None
+        
+        return row["username"]
 
 def delete_session(token: str):
-    """删除会话"""
-    sessions = load_sessions()
-    if token in sessions:
-        del sessions[token]
-        save_sessions(sessions)
+    """删除管理员会话"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM admin_sessions WHERE token = ?", (token,))
 
 def load_views() -> dict:
     """加载阅读量数据"""
@@ -316,99 +492,107 @@ def require_admin(session_token: Optional[str] = Cookie(None, alias="knowhub_ses
     return user
 
 # ============================================================
-# 用户/会员系统
+# 用户/会员系统（SQLite 版）
 # ============================================================
-def load_users() -> dict:
-    """加载用户数据"""
-    if USERS_FILE.exists():
-        return json.loads(USERS_FILE.read_text(encoding="utf-8"))
-    return {}
-
-def save_users(users: dict):
-    """保存用户数据"""
-    USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def load_ai_usage() -> dict:
-    """加载 AI 使用记录"""
-    if AI_USAGE_FILE.exists():
-        return json.loads(AI_USAGE_FILE.read_text(encoding="utf-8"))
-    return {}
-
-def save_ai_usage(usage: dict):
-    """保存 AI 使用记录"""
-    AI_USAGE_FILE.write_text(json.dumps(usage, ensure_ascii=False, indent=2), encoding="utf-8")
-
 def hash_password(password: str) -> str:
     """密码哈希"""
     return hashlib.sha256(password.encode()).hexdigest()
 
 def create_user(username: str, password: str, email: str = "") -> dict:
     """创建用户"""
-    users = load_users()
-    if username in users:
-        raise ValueError("用户名已存在")
-    
-    user = {
-        "username": username,
-        "password": hash_password(password),
-        "email": email,
-        "level": "basic",  # 默认注册用户
-        "created_at": datetime.now().isoformat(),
-        "session_token": None
-    }
-    users[username] = user
-    save_users(users)
-    return user
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # 检查用户名是否存在
+        cursor.execute("SELECT username FROM users WHERE username = ?", (username,))
+        if cursor.fetchone():
+            raise ValueError("用户名已存在")
+        
+        created_at = get_timestamp()
+        cursor.execute("""
+            INSERT INTO users (username, password, email, level, created_at)
+            VALUES (?, ?, ?, 'basic', ?)
+        """, (username, hash_password(password), email, created_at))
+        
+        return {
+            "username": username,
+            "email": email,
+            "level": "basic",
+            "created_at": created_at,
+            "session_token": None
+        }
 
 def verify_user(username: str, password: str) -> Optional[dict]:
     """验证用户"""
-    users = load_users()
-    user = users.get(username)
-    if user and user["password"] == hash_password(password):
-        return user
-    return None
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT username, password, email, level, level_expire_at, session_token, created_at 
+            FROM users WHERE username = ?
+        """, (username,))
+        row = cursor.fetchone()
+        
+        if row and row["password"] == hash_password(password):
+            return dict(row)
+        return None
 
 def get_user_by_token(token: str) -> Optional[dict]:
     """通过 token 获取用户"""
     if not token:
         return None
-    users = load_users()
-    for user in users.values():
-        if user.get("session_token") == token:
-            return user
-    return None
+    
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT username, email, level, level_expire_at, session_token, created_at 
+            FROM users WHERE session_token = ?
+        """, (token,))
+        row = cursor.fetchone()
+        
+        if row:
+            return dict(row)
+        return None
 
 def create_user_session(username: str) -> str:
     """创建用户会话"""
-    users = load_users()
-    if username not in users:
-        return None
     token = secrets.token_hex(32)
-    users[username]["session_token"] = token
-    save_users(users)
+    
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET session_token = ? WHERE username = ?", (token, username))
+        
+        if cursor.rowcount == 0:
+            return None
+    
     return token
 
-def get_user_ai_usage_today(username: str) -> int:
-    """获取用户今日 AI 使用次数"""
-    usage = load_ai_usage()
+def get_user_ai_usage_today(identifier: str) -> int:
+    """获取用户/IP 今日 AI 使用次数"""
     today = datetime.now().strftime("%Y-%m-%d")
-    user_usage = usage.get(username, {})
-    return user_usage.get(today, 0)
+    
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT count FROM ai_usage WHERE identifier = ? AND date = ?", (identifier, today))
+        row = cursor.fetchone()
+        
+        return row["count"] if row else 0
 
-def increment_user_ai_usage(username: str):
-    """增加用户 AI 使用次数"""
-    usage = load_ai_usage()
+def increment_user_ai_usage(identifier: str):
+    """增加用户/IP AI 使用次数"""
     today = datetime.now().strftime("%Y-%m-%d")
     
-    if username not in usage:
-        usage[username] = {}
-    
-    # 清理 7 天前的记录
-    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-    usage[username] = {k: v for k, v in usage[username].items() if k >= week_ago}
-    
-    usage[username][today] = usage[username].get(today, 0) + 1
-    save_ai_usage(usage)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        # 使用 UPSERT 操作
+        cursor.execute("""
+            INSERT INTO ai_usage (identifier, date, count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(identifier, date) DO UPDATE SET count = count + 1
+        """, (identifier, today))
+        
+        # 清理 7 天前的记录（每次增加时顺便清理）
+        week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        cursor.execute("DELETE FROM ai_usage WHERE date < ?", (week_ago,))
 
 def check_ai_permission(user: Optional[dict], client_ip: str) -> tuple[bool, str, int, int]:
     """
@@ -431,11 +615,8 @@ def check_ai_permission(user: Optional[dict], client_ip: str) -> tuple[bool, str
         level_config = MEMBER_LEVELS["free"]
         daily_limit = level_config["daily_ai_limit"]
         
-        # 用 IP 作为标识
-        usage = load_ai_usage()
-        today = datetime.now().strftime("%Y-%m-%d")
         ip_key = f"ip:{client_ip}"
-        used_today = usage.get(ip_key, {}).get(today, 0)
+        used_today = get_user_ai_usage_today(ip_key)
         
         if used_today >= daily_limit:
             return False, f"游客每天只能使用 {daily_limit} 次 AI，注册后可获得更多次数", used_today, daily_limit
@@ -444,29 +625,12 @@ def check_ai_permission(user: Optional[dict], client_ip: str) -> tuple[bool, str
 
 def increment_guest_ai_usage(client_ip: str):
     """增加游客 AI 使用次数"""
-    usage = load_ai_usage()
-    today = datetime.now().strftime("%Y-%m-%d")
     ip_key = f"ip:{client_ip}"
-    
-    if ip_key not in usage:
-        usage[ip_key] = {}
-    
-    usage[ip_key][today] = usage[ip_key].get(today, 0) + 1
-    save_ai_usage(usage)
+    increment_user_ai_usage(ip_key)
 
 # ============================================================
-# 激活码系统
+# 激活码系统（SQLite 版）
 # ============================================================
-def load_codes() -> dict:
-    """加载激活码数据"""
-    if CODES_FILE.exists():
-        return json.loads(CODES_FILE.read_text(encoding="utf-8"))
-    return {}
-
-def save_codes(codes: dict):
-    """保存激活码数据"""
-    CODES_FILE.write_text(json.dumps(codes, ensure_ascii=False, indent=2), encoding="utf-8")
-
 def generate_activation_code() -> str:
     """生成激活码（格式：XXXX-XXXX-XXXX-XXXX）"""
     import string
@@ -476,26 +640,27 @@ def generate_activation_code() -> str:
 
 def create_activation_codes(count: int, level: str, days: int) -> list:
     """批量创建激活码"""
-    codes = load_codes()
     new_codes = []
+    created_at = get_timestamp()
     
-    for _ in range(count):
-        code = generate_activation_code()
-        # 确保不重复
-        while code in codes:
-            code = generate_activation_code()
+    with get_db() as conn:
+        cursor = conn.cursor()
         
-        codes[code] = {
-            "level": level,
-            "days": days,
-            "created_at": datetime.now().isoformat(),
-            "used": False,
-            "used_by": None,
-            "used_at": None
-        }
-        new_codes.append(code)
+        for _ in range(count):
+            code = generate_activation_code()
+            # 确保不重复
+            while True:
+                cursor.execute("SELECT code FROM activation_codes WHERE code = ?", (code,))
+                if not cursor.fetchone():
+                    break
+                code = generate_activation_code()
+            
+            cursor.execute("""
+                INSERT INTO activation_codes (code, level, days, created_at, used, used_by, used_at)
+                VALUES (?, ?, ?, ?, 0, NULL, NULL)
+            """, (code, level, days, created_at))
+            new_codes.append(code)
     
-    save_codes(codes)
     return new_codes
 
 def use_activation_code(code: str, username: str) -> tuple[bool, str, dict]:
@@ -503,59 +668,67 @@ def use_activation_code(code: str, username: str) -> tuple[bool, str, dict]:
     使用激活码
     返回: (成功, 消息, 激活信息)
     """
-    codes = load_codes()
-    
     code = code.upper().strip()
     
-    if code not in codes:
-        return False, "激活码不存在", {}
-    
-    code_info = codes[code]
-    
-    if code_info["used"]:
-        return False, f"激活码已被使用（使用者: {code_info['used_by']}）", {}
-    
-    # 标记激活码已使用
-    codes[code]["used"] = True
-    codes[code]["used_by"] = username
-    codes[code]["used_at"] = datetime.now().isoformat()
-    save_codes(codes)
-    
-    # 更新用户会员等级和到期时间
-    users = load_users()
-    if username not in users:
-        return False, "用户不存在", {}
-    
-    level = code_info["level"]
-    days = code_info["days"]
-    
-    # 计算到期时间
-    current_expire = users[username].get("vip_expire")
-    if current_expire:
-        try:
-            expire_date = datetime.fromisoformat(current_expire)
-            if expire_date > datetime.now():
-                # 如果还没过期，在现有基础上增加
-                new_expire = expire_date + timedelta(days=days)
-            else:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # 查询激活码
+        cursor.execute("SELECT * FROM activation_codes WHERE code = ?", (code,))
+        row = cursor.fetchone()
+        
+        if not row:
+            return False, "激活码不存在", {}
+        
+        if row["used"]:
+            return False, f"激活码已被使用（使用者: {row['used_by']}）", {}
+        
+        # 标记激活码已使用
+        cursor.execute("""
+            UPDATE activation_codes 
+            SET used = 1, used_by = ?, used_at = ?
+            WHERE code = ?
+        """, (username, get_timestamp(), code))
+        
+        # 查询用户
+        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+        user_row = cursor.fetchone()
+        
+        if not user_row:
+            return False, "用户不存在", {}
+        
+        level = row["level"]
+        days = row["days"]
+        
+        # 计算到期时间
+        current_expire = user_row["level_expire_at"]
+        if current_expire:
+            try:
+                expire_date = datetime.fromisoformat(current_expire)
+                if expire_date > datetime.now():
+                    # 如果还没过期，在现有基础上增加
+                    new_expire = expire_date + timedelta(days=days)
+                else:
+                    new_expire = datetime.now() + timedelta(days=days)
+            except:
                 new_expire = datetime.now() + timedelta(days=days)
-        except:
+        else:
             new_expire = datetime.now() + timedelta(days=days)
-    else:
-        new_expire = datetime.now() + timedelta(days=days)
-    
-    users[username]["level"] = level
-    users[username]["vip_expire"] = new_expire.isoformat()
-    save_users(users)
-    
-    level_config = MEMBER_LEVELS.get(level, MEMBER_LEVELS["basic"])
-    
-    return True, "激活成功", {
-        "level": level,
-        "level_name": level_config["name"],
-        "days": days,
-        "expire_date": new_expire.strftime("%Y-%m-%d")
-    }
+        
+        # 更新用户等级
+        cursor.execute("""
+            UPDATE users SET level = ?, level_expire_at = ?
+            WHERE username = ?
+        """, (level, new_expire.isoformat(), username))
+        
+        level_config = MEMBER_LEVELS.get(level, MEMBER_LEVELS["basic"])
+        
+        return True, "激活成功", {
+            "level": level,
+            "level_name": level_config["name"],
+            "days": days,
+            "expire_date": new_expire.strftime("%Y-%m-%d")
+        }
 
 def find_node(tree: List[dict], node_id: str) -> Optional[dict]:
     """在树中查找节点"""
@@ -834,12 +1007,12 @@ def set_user_level(
     if level not in MEMBER_LEVELS:
         raise HTTPException(status_code=400, detail=f"无效的等级，可选: {', '.join(MEMBER_LEVELS.keys())}")
     
-    users = load_users()
-    if username not in users:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    
-    users[username]["level"] = level
-    save_users(users)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET level = ? WHERE username = ?", (level, username))
+        
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="用户不存在")
     
     level_config = MEMBER_LEVELS[level]
     return {
@@ -853,21 +1026,25 @@ def set_user_level(
 @app.get("/api/admin/users")
 def list_users(_: str = Depends(require_admin)):
     """管理员获取所有用户"""
-    users = load_users()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT username, email, level, level_expire_at, created_at FROM users ORDER BY created_at DESC")
+        rows = cursor.fetchall()
+    
     result = []
-    for username, user in users.items():
-        level = user.get("level", "basic")
+    for row in rows:
+        level = row["level"] or "basic"
         level_config = MEMBER_LEVELS.get(level, MEMBER_LEVELS["basic"])
-        used_today = get_user_ai_usage_today(username)
+        used_today = get_user_ai_usage_today(row["username"])
         result.append({
-            "username": username,
-            "email": user.get("email", ""),
+            "username": row["username"],
+            "email": row["email"] or "",
             "level": level,
             "level_name": level_config["name"],
             "ai_limit": level_config["daily_ai_limit"],
             "ai_used_today": used_today,
-            "created_at": user.get("created_at", ""),
-            "vip_expire": user.get("vip_expire", "")
+            "created_at": row["created_at"] or "",
+            "vip_expire": row["level_expire_at"] or ""
         })
     return {"users": result}
 
@@ -901,36 +1078,39 @@ def generate_codes(request: GenerateCodesRequest, _: str = Depends(require_admin
 @app.get("/api/admin/codes")
 def list_codes(_: str = Depends(require_admin)):
     """管理员查看所有激活码"""
-    codes = load_codes()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM activation_codes ORDER BY created_at DESC")
+        rows = cursor.fetchall()
+    
     result = []
-    for code, info in codes.items():
-        level_config = MEMBER_LEVELS.get(info["level"], MEMBER_LEVELS["basic"])
+    for row in rows:
+        level_config = MEMBER_LEVELS.get(row["level"], MEMBER_LEVELS["basic"])
         result.append({
-            "code": code,
-            "level": info["level"],
+            "code": row["code"],
+            "level": row["level"],
             "level_name": level_config["name"],
-            "days": info["days"],
-            "used": info["used"],
-            "used_by": info.get("used_by"),
-            "used_at": info.get("used_at"),
-            "created_at": info["created_at"]
+            "days": row["days"],
+            "used": bool(row["used"]),
+            "used_by": row["used_by"],
+            "used_at": row["used_at"],
+            "created_at": row["created_at"]
         })
     
-    # 按创建时间倒序
-    result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"codes": result}
 
 @app.delete("/api/admin/codes/{code}")
 def delete_code(code: str, _: str = Depends(require_admin)):
     """管理员删除激活码"""
-    codes = load_codes()
     code = code.upper()
     
-    if code not in codes:
-        raise HTTPException(status_code=404, detail="激活码不存在")
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM activation_codes WHERE code = ?", (code,))
+        
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="激活码不存在")
     
-    del codes[code]
-    save_codes(codes)
     return {"status": "ok"}
 
 @app.post("/api/user/activate")
@@ -1929,12 +2109,19 @@ if IMAGES_DIR.exists():
 # ============================================================
 # 启动
 # ============================================================
+# 初始化数据库
+init_db()
+
+# 迁移旧数据（如果存在）
+migrate_json_to_sqlite()
+
 if __name__ == "__main__":
     print("=" * 50)
     print("  KnowHub - 个人知识库")
     print("=" * 50)
     print(f"  访问地址: http://localhost:8090")
     print(f"  文档目录: {DOCS_DIR}")
+    print(f"  数据库: {DB_FILE}")
     print("=" * 50)
     uvicorn.run(app, host="0.0.0.0", port=8090)
 

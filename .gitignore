@@ -22,6 +22,15 @@ data/users.json
 data/ai_usage.json
 data/activation_codes.json
 
+# SQLite 数据库（包含用户数据，不要上传）
+data/knowhub.db
+data/knowhub.db-journal
+data/knowhub.db-wal
+data/knowhub.db-shm
+
+# 迁移后的备份文件
+data/*.json.bak
+
 # 可选：如果评论和浏览量也不想上传
 # data/comments.json
 # data/views.json
